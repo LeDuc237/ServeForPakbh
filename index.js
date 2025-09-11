@@ -16,7 +16,14 @@ if (!process.env.STRIPE_SECRET_KEY) {
   process.exit(1);
 }
 
-console.log('🔑 Stripe initialized with key:', process.env.STRIPE_SECRET_KEY ? 'Present' : 'Missing');
+// Check if we're in live mode
+const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_');
+console.log('🔑 Stripe initialized:', process.env.STRIPE_SECRET_KEY ? 'Present' : 'Missing');
+console.log('🌍 Stripe mode:', isLiveMode ? 'LIVE' : 'TEST');
+
+if (!isLiveMode && process.env.NODE_ENV === 'production') {
+  console.warn('⚠️ WARNING: Using test keys in production environment');
+}
 
 // Middleware
 app.use(cors({
@@ -25,7 +32,8 @@ app.use(cors({
     'http://localhost:3000', 
     'https://pakbh.com',
     'https://www.pakbh.com',
-    'https://delicate-banoffee-384c86.netlify.app'
+    'https://delicate-banoffee-384c86.netlify.app',
+    process.env.FRONTEND_URL
   ],
   credentials: true
 }));
@@ -335,14 +343,17 @@ const handlePaymentError = (error, paymentMethod = 'unknown') => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_');
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     stripe_connected: !!stripe,
     stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
+    stripe_mode: isLiveMode ? 'live' : 'test',
     email_configured: !!process.env.EMAIL_USER,
     environment: process.env.NODE_ENV || 'development',
-    supported_payment_methods: ['stripe', 'paypal']
+    supported_payment_methods: ['stripe', 'paypal'],
+    paypal_configured: !!process.env.PAYPAL_CLIENT_ID
   });
 });
 
