@@ -16,42 +16,64 @@ if (!process.env.STRIPE_SECRET_KEY) {
   process.exit(1);
 }
 
-// Check if we're in live mode
-const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_');
-console.log('🔑 Stripe initialized:', process.env.STRIPE_SECRET_KEY ? 'Present' : 'Missing');
-console.log('🌍 Stripe mode:', isLiveMode ? 'LIVE' : 'TEST');
+console.log('🔑 Stripe initialized with key:', process.env.STRIPE_SECRET_KEY ? 'Present' : 'Missing');
 
-if (!isLiveMode && process.env.NODE_ENV === 'production') {
-  console.warn('⚠️ WARNING: Using test keys in production environment');
-}
+// CORS configuration - FIXED: Simplified and made more robust
+const allowedOrigins = [
+  'http://localhost:5173', 
+  'http://localhost:3000', 
+  'https://pakbh.com',
+  'https://www.pakbh.com',
+  'https://delicate-banoffee-384c86.netlify.app',
+  'https://blenhairs.netlify.app',
+  'https://serveforpakbh.onrender.com'
+];
 
-// Middleware
 app.use(cors({
-  origin: [
-    'http://localhost:5173', 
-    'http://localhost:3000', 
-    'https://pakbh.com',
-    'https://www.pakbh.com',
-    'https://delicate-banoffee-384c86.netlify.app',
-    process.env.FRONTEND_URL
-  ],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
   credentials: true
 }));
 
-// Raw body parser for webhooks
+// Handle preflight requests
+app.options('*', cors());
+
+// Raw body parser for webhooks - must come before express.json()
 app.use('/api/webhook', express.raw({type: 'application/json'}));
 
 // JSON parser for other routes
 app.use(express.json());
 
-// Email transporter setup - FIXED: createTransporter -> createTransport
-const emailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER || 'your-email@gmail.com',
-    pass: process.env.EMAIL_PASS || 'your-app-password'
-  }
-});
+// Email transporter setup
+let emailTransporter;
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  emailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
+    }
+  });
+  
+  // Verify email configuration
+  emailTransporter.verify((error) => {
+    if (error) {
+      console.error('❌ Email transporter verification failed:', error);
+    } else {
+      console.log('✅ Email transporter is ready');
+    }
+  });
+} else {
+  console.warn('⚠️ Email credentials not configured - order emails will not be sent');
+}
 
 // Create Payment Intent for Stripe
 app.post('/api/create-payment-intent', async (req, res) => {
@@ -60,7 +82,10 @@ app.post('/api/create-payment-intent', async (req, res) => {
 
     // Validate amount
     if (!amount || amount < 50) { // Minimum 50 cents
-      return res.status(400).json({ error: 'Invalid amount' });
+      return res.status(400).json({ 
+        error: 'Invalid amount',
+        details: 'Amount must be at least $0.50'
+      });
     }
 
     // Create payment intent
@@ -77,12 +102,13 @@ app.post('/api/create-payment-intent', async (req, res) => {
         items_count: items?.length?.toString() || '0'
       },
       receipt_email: customer?.email,
-      description: 'Premium Afro Kinky Bulk Hair - PAKBH'
+      description: 'Premium Afro Kinky Bulk Hair - Blen Hairs USA'
     });
 
     console.log('✅ Payment Intent created:', paymentIntent.id);
 
     res.json({
+      success: true,
       client_secret: paymentIntent.client_secret,
       payment_intent_id: paymentIntent.id
     });
@@ -90,7 +116,9 @@ app.post('/api/create-payment-intent', async (req, res) => {
   } catch (error) {
     console.error('❌ Error creating payment intent:', error);
     res.status(500).json({ 
-      error: error.message || 'Failed to create payment intent' 
+      success: false,
+      error: error.message || 'Failed to create payment intent',
+      code: error.type || 'unknown_error'
     });
   }
 });
@@ -99,6 +127,14 @@ app.post('/api/create-payment-intent', async (req, res) => {
 app.post('/api/process-paypal-payment', async (req, res) => {
   try {
     const { orderID, payerID, amount, customer, items } = req.body;
+
+    // Validate required fields
+    if (!orderID || !payerID || !amount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required payment information'
+      });
+    }
 
     console.log('🟡 Processing PayPal payment:', { orderID, payerID, amount });
 
@@ -120,8 +156,10 @@ app.post('/api/process-paypal-payment', async (req, res) => {
       payment_method: 'PayPal'
     };
 
-    // Send confirmation emails
-    await sendOrderEmails(paypalPayment, customer, items, amount);
+    // Send confirmation emails if email is configured
+    if (emailTransporter) {
+      await sendOrderEmails(paypalPayment, customer, items, amount);
+    }
 
     console.log('✅ PayPal payment processed successfully');
 
@@ -133,6 +171,7 @@ app.post('/api/process-paypal-payment', async (req, res) => {
   } catch (error) {
     console.error('❌ Error processing PayPal payment:', error);
     res.status(500).json({ 
+      success: false,
       error: error.message || 'Failed to process PayPal payment' 
     });
   }
@@ -143,11 +182,20 @@ app.post('/api/confirm-payment', async (req, res) => {
   try {
     const { payment_intent_id } = req.body;
 
+    if (!payment_intent_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment intent ID is required'
+      });
+    }
+
     const paymentIntent = await stripe.paymentIntents.retrieve(payment_intent_id);
 
     if (paymentIntent.status === 'succeeded') {
-      // Send confirmation emails
-      await sendOrderEmails(paymentIntent);
+      // Send confirmation emails if email is configured
+      if (emailTransporter) {
+        await sendOrderEmails(paymentIntent);
+      }
       
       console.log('✅ Payment confirmed and emails sent');
       
@@ -158,13 +206,15 @@ app.post('/api/confirm-payment', async (req, res) => {
     } else {
       res.json({
         success: false,
-        status: paymentIntent.status
+        status: paymentIntent.status,
+        message: `Payment status is ${paymentIntent.status}`
       });
     }
 
   } catch (error) {
     console.error('❌ Error confirming payment:', error);
     res.status(500).json({ 
+      success: false,
       error: error.message || 'Failed to confirm payment' 
     });
   }
@@ -174,6 +224,12 @@ app.post('/api/confirm-payment', async (req, res) => {
 app.post('/api/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  // Check if webhook secret is configured
+  if (!webhookSecret) {
+    console.error('❌ STRIPE_WEBHOOK_SECRET is not configured');
+    return res.status(500).json({ error: 'Webhook secret not configured' });
+  }
 
   let event;
 
@@ -185,25 +241,32 @@ app.post('/api/webhook', async (req, res) => {
   }
 
   // Handle the event
-  switch (event.type) {
-    case 'payment_intent.succeeded':
-      const paymentIntent = event.data.object;
-      console.log('✅ Payment succeeded via webhook:', paymentIntent.id);
-      
-      // Send confirmation emails
-      await sendOrderEmails(paymentIntent);
-      break;
+  try {
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+        const paymentIntent = event.data.object;
+        console.log('✅ Payment succeeded via webhook:', paymentIntent.id);
+        
+        // Send confirmation emails if email is configured
+        if (emailTransporter) {
+          await sendOrderEmails(paymentIntent);
+        }
+        break;
 
-    case 'payment_intent.payment_failed':
-      const failedPayment = event.data.object;
-      console.log('❌ Payment failed via webhook:', failedPayment.id);
-      break;
+      case 'payment_intent.payment_failed':
+        const failedPayment = event.data.object;
+        console.log('❌ Payment failed via webhook:', failedPayment.id);
+        break;
 
-    default:
-      console.log(`ℹ️ Unhandled event type ${event.type}`);
+      default:
+        console.log(`ℹ️ Unhandled event type ${event.type}`);
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('❌ Error handling webhook event:', error);
+    res.status(500).json({ error: 'Failed to process webhook event' });
   }
-
-  res.json({received: true});
 });
 
 // Send order confirmation emails (works for both Stripe and PayPal)
@@ -279,7 +342,7 @@ async function sendOrderEmails(paymentData, customer = null, items = null, total
             <p style="font-size: 16px; color: #333;">
               Hi ${customerName},
             </p>
-            <p style="font-size: 16px; color: ' #333;'>
+            <p style="font-size: 16px; color: #333;">
               Thank you for choosing PAKBH! We've received your payment of <strong>$${amount}</strong> via ${paymentMethod} and are preparing your order for shipment.
             </p>
             
@@ -320,40 +383,20 @@ async function sendOrderEmails(paymentData, customer = null, items = null, total
   }
 }
 
-// Enhanced error handling for all payment methods
-const handlePaymentError = (error, paymentMethod = 'unknown') => {
-  console.error(`❌ ${paymentMethod} payment error:`, error);
-  
-  if (error.type === 'StripeCardError') {
-    return { error: error.message, code: error.code };
-  } else if (error.type === 'StripeRateLimitError') {
-    return { error: 'Too many requests made to the API too quickly', code: 'rate_limit' };
-  } else if (error.type === 'StripeInvalidRequestError') {
-    return { error: 'Invalid parameters were supplied to Stripe API', code: 'invalid_request' };
-  } else if (error.type === 'StripeAPIError') {
-    return { error: 'An error occurred internally with Stripe API', code: 'api_error' };
-  } else if (error.type === 'StripeConnectionError') {
-    return { error: 'Network communication with Stripe failed', code: 'connection_error' };
-  } else if (error.type === 'StripeAuthenticationError') {
-    return { error: 'Authentication with Stripe API failed', code: 'authentication_error' };
-  } else {
-    return { error: 'An unexpected error occurred', code: 'unknown_error' };
-  }
-};
-
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_');
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
+    market: 'United States',
+    location: 'Miami, FL',
     stripe_connected: !!stripe,
     stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
-    stripe_mode: isLiveMode ? 'live' : 'test',
-    email_configured: !!process.env.EMAIL_USER,
+    email_configured: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS),
     environment: process.env.NODE_ENV || 'development',
     supported_payment_methods: ['stripe', 'paypal'],
-    paypal_configured: !!process.env.PAYPAL_CLIENT_ID
+    shipping_zones: ['US', 'Canada', 'Mexico', 'Caribbean', 'International'],
+    cors_allowed_origins: allowedOrigins
   });
 });
 
@@ -364,6 +407,7 @@ app.get('/api/payment-intent/:id', async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.retrieve(id);
     
     res.json({
+      success: true,
       id: paymentIntent.id,
       status: paymentIntent.status,
       amount: paymentIntent.amount,
@@ -375,15 +419,25 @@ app.get('/api/payment-intent/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ Error retrieving payment intent:', error);
     res.status(500).json({ 
+      success: false,
       error: error.message || 'Failed to retrieve payment intent' 
     });
   }
+});
+
+// 404 handler for API routes
+app.use('/api/*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'API endpoint not found'
+  });
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('❌ Server error:', error);
   res.status(500).json({ 
+    success: false,
     error: 'Internal server error',
     message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
   });
@@ -391,11 +445,14 @@ app.use((error, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Blen Hairs USA Server running on port ${PORT}`);
+  console.log(`🇺🇸 Market: United States (Miami, FL)`);
   console.log(`📧 Email service: ${process.env.EMAIL_USER ? 'Configured' : 'Not configured'}`);
   console.log(`💳 Stripe: ${process.env.STRIPE_SECRET_KEY ? 'Connected' : 'Not configured'}`);
   console.log(`🔗 Webhook endpoint: http://localhost:${PORT}/api/webhook`);
-  console.log(`💰 Supported payments: Stripe Cards, PayPal`);
+  console.log(`💰 Supported payments: US Credit Cards, PayPal`);
+  console.log(`🚚 Shipping: Free US shipping, Canada/Mexico/International available`);
+  console.log(`🌐 CORS enabled for origins: ${allowedOrigins.join(', ')}`);
 });
 
 module.exports = app;
