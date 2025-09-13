@@ -1,27 +1,32 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+const stripe = require('stripe');
 require('dotenv').config();
-
-// Initialize Stripe with secret key
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Validate Stripe configuration
-if (!process.env.STRIPE_SECRET_KEY) {
-  console.error('❌ STRIPE_SECRET_KEY is required in .env file');
-  console.error('Please add your Stripe secret key to the .env file');
+// Validate environment variables
+const requiredEnvVars = ['STRIPE_SECRET_KEY', 'EMAIL_USER', 'EMAIL_PASS', 'BUSINESS_EMAIL'];
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
+  console.error('Please add them to your .env file');
   process.exit(1);
 }
 
-console.log('🔑 Stripe initialized with key:', process.env.STRIPE_SECRET_KEY ? 'Present' : 'Missing');
+// Initialize Stripe with secret key
+const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
 
-// CORS configuration - FIXED: Simplified and made more robust
+console.log('🔑 Stripe initialized successfully');
+console.log('📧 Email service configured');
+
+// CORS configuration
 const allowedOrigins = [
-  'http://localhost:5173', 
-  'http://localhost:3000', 
+  'http://localhost:5173',
+  'http://localhost:3000',
   'https://pakbh.com',
   'https://www.pakbh.com',
   'https://delicate-banoffee-384c86.netlify.app',
@@ -35,7 +40,7 @@ app.use(cors({
     if (!origin) return callback(null, true);
     
     if (allowedOrigins.indexOf(origin) === -1) {
-      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
       return callback(new Error(msg), false);
     }
     return callback(null, true);
@@ -43,55 +48,78 @@ app.use(cors({
   credentials: true
 }));
 
-// Handle preflight requests
-app.options('*', cors());
-
-// Raw body parser for webhooks - must come before express.json()
-app.use('/api/webhook', express.raw({type: 'application/json'}));
+// Raw body parser for webhooks
+app.use('/api/webhook', express.raw({ type: 'application/json' }));
 
 // JSON parser for other routes
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Email transporter setup
-let emailTransporter;
-if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-  emailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
-    }
-  });
-  
-  // Verify email configuration
-  emailTransporter.verify((error) => {
-    if (error) {
-      console.error('❌ Email transporter verification failed:', error);
-    } else {
-      console.log('✅ Email transporter is ready');
-    }
-  });
-} else {
-  console.warn('⚠️ Email credentials not configured - order emails will not be sent');
-}
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// Verify email configuration
+emailTransporter.verify((error) => {
+  if (error) {
+    console.error('❌ Email transporter verification failed:', error);
+  } else {
+    console.log('✅ Email transporter is ready to send messages');
+  }
+});
+
+// Utility functions
+const formatCurrency = (amount, currency = 'USD') => {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: currency,
+  }).format(amount / 100); // Convert cents to dollars
+};
+
+const validatePaymentData = (data) => {
+  const errors = [];
+
+  if (!data.amount || data.amount < 50) {
+    errors.push('Invalid amount (minimum $0.50)');
+  }
+
+  if (!data.currency || !['usd', 'eur', 'gbp'].includes(data.currency.toLowerCase())) {
+    errors.push('Invalid currency');
+  }
+
+  if (!data.customer || !data.customer.email) {
+    errors.push('Customer email is required');
+  }
+
+  if (!data.items || !Array.isArray(data.items) || data.items.length === 0) {
+    errors.push('At least one item is required');
+  }
+
+  return errors;
+};
 
 // Create Payment Intent for Stripe
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
-    const { amount, currency = 'usd', customer, items, metadata } = req.body;
+    const { amount, currency = 'usd', customer, items, metadata, shipping } = req.body;
 
-    // Validate amount
-    if (!amount || amount < 50) { // Minimum 50 cents
+    // Validate input
+    const validationErrors = validatePaymentData(req.body);
+    if (validationErrors.length > 0) {
       return res.status(400).json({ 
-        error: 'Invalid amount',
-        details: 'Amount must be at least $0.50'
+        error: 'Validation failed', 
+        details: validationErrors 
       });
     }
 
-    // Create payment intent
-    const paymentIntent = await stripe.paymentIntents.create({
+    // Create payment intent with automatic payment methods
+    const paymentIntent = await stripeClient.paymentIntents.create({
       amount: Math.round(amount),
-      currency,
+      currency: currency.toLowerCase(),
       automatic_payment_methods: {
         enabled: true,
       },
@@ -99,10 +127,21 @@ app.post('/api/create-payment-intent', async (req, res) => {
         ...metadata,
         customer_email: customer?.email || '',
         customer_name: customer?.name || '',
-        items_count: items?.length?.toString() || '0'
+        items_count: items?.length?.toString() || '0',
+        order_id: metadata?.order_id || `order_${Date.now()}`
       },
       receipt_email: customer?.email,
-      description: 'Premium Afro Kinky Bulk Hair - Blen Hairs USA'
+      description: 'Premium Afro Kinky Bulk Hair - Blen Hairs USA',
+      shipping: shipping ? {
+        name: shipping.name,
+        address: {
+          line1: shipping.address.line1,
+          city: shipping.address.city,
+          state: shipping.address.state,
+          postal_code: shipping.address.postal_code,
+          country: shipping.address.country || 'US'
+        }
+      } : undefined
     });
 
     console.log('✅ Payment Intent created:', paymentIntent.id);
@@ -110,56 +149,118 @@ app.post('/api/create-payment-intent', async (req, res) => {
     res.json({
       success: true,
       client_secret: paymentIntent.client_secret,
-      payment_intent_id: paymentIntent.id
+      payment_intent_id: paymentIntent.id,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency
     });
 
   } catch (error) {
     console.error('❌ Error creating payment intent:', error);
-    res.status(500).json({ 
+    
+    const errorResponse = handlePaymentError(error, 'stripe');
+    res.status(errorResponse.status || 500).json({ 
       success: false,
-      error: error.message || 'Failed to create payment intent',
-      code: error.type || 'unknown_error'
+      error: errorResponse.message,
+      code: errorResponse.code
     });
   }
 });
 
-// Process PayPal Payment
+// Create Checkout Session for Stripe Checkout
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const { lineItems, customerEmail, successUrl, cancelUrl, metadata } = req.body;
+
+    const session = await stripeClient.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: lineItems,
+      mode: 'payment',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      customer_email: customerEmail,
+      billing_address_collection: 'required',
+      shipping_address_collection: {
+        allowed_countries: ['US', 'CA', 'GB', 'FR', 'DE']
+      },
+      metadata: metadata || {},
+      shipping_options: [
+        {
+          shipping_rate_data: {
+            type: 'fixed_amount',
+            fixed_amount: {
+              amount: 0,
+              currency: 'usd'
+            },
+            display_name: 'Free shipping',
+            delivery_estimate: {
+              minimum: {
+                unit: 'business_day',
+                value: 5
+              },
+              maximum: {
+                unit: 'business_day',
+                value: 7
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    res.json({
+      success: true,
+      sessionId: session.id,
+      url: session.url
+    });
+
+  } catch (error) {
+    console.error('❌ Error creating checkout session:', error);
+    
+    const errorResponse = handlePaymentError(error, 'stripe');
+    res.status(errorResponse.status || 500).json({ 
+      success: false,
+      error: errorResponse.message,
+      code: errorResponse.code
+    });
+  }
+});
+
+// Process PayPal Payment (Simulation)
 app.post('/api/process-paypal-payment', async (req, res) => {
   try {
-    const { orderID, payerID, amount, customer, items } = req.body;
+    const { orderID, amount, customer, items } = req.body;
 
-    // Validate required fields
-    if (!orderID || !payerID || !amount) {
+    if (!orderID || !amount || !customer) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required payment information'
+        error: 'Missing required fields'
       });
     }
 
-    console.log('🟡 Processing PayPal payment:', { orderID, payerID, amount });
+    console.log('🟡 Processing PayPal payment simulation:', { orderID, amount: formatCurrency(amount, 'USD') });
 
-    // In a real implementation, you would verify the PayPal payment here
-    // For now, we'll simulate successful processing
-    
+    // Simulate PayPal payment processing
     const paypalPayment = {
       id: orderID,
       status: 'COMPLETED',
       amount: {
         currency_code: 'USD',
-        value: amount.toFixed(2)
+        value: (amount / 100).toFixed(2)
       },
       payer: {
-        payer_id: payerID,
-        email_address: customer?.email
+        payer_id: `P${Date.now()}`,
+        email_address: customer.email,
+        name: {
+          given_name: customer.name.split(' ')[0],
+          surname: customer.name.split(' ').slice(1).join(' ')
+        }
       },
       create_time: new Date().toISOString(),
       payment_method: 'PayPal'
     };
 
-    // Send confirmation emails if email is configured
-    if (emailTransporter) {
-      await sendOrderEmails(paypalPayment, customer, items, amount);
-    }
+    // Send confirmation emails
+    await sendOrderEmails(paypalPayment, customer, items, amount);
 
     console.log('✅ PayPal payment processed successfully');
 
@@ -172,12 +273,12 @@ app.post('/api/process-paypal-payment', async (req, res) => {
     console.error('❌ Error processing PayPal payment:', error);
     res.status(500).json({ 
       success: false,
-      error: error.message || 'Failed to process PayPal payment' 
+      error: error.message || 'Failed to process PayPal payment'
     });
   }
 });
 
-// Confirm Payment (webhook alternative for demo)
+// Confirm Payment
 app.post('/api/confirm-payment', async (req, res) => {
   try {
     const { payment_intent_id } = req.body;
@@ -189,13 +290,11 @@ app.post('/api/confirm-payment', async (req, res) => {
       });
     }
 
-    const paymentIntent = await stripe.paymentIntents.retrieve(payment_intent_id);
+    const paymentIntent = await stripeClient.paymentIntents.retrieve(payment_intent_id);
 
     if (paymentIntent.status === 'succeeded') {
-      // Send confirmation emails if email is configured
-      if (emailTransporter) {
-        await sendOrderEmails(paymentIntent);
-      }
+      // Send confirmation emails
+      await sendOrderEmails(paymentIntent);
       
       console.log('✅ Payment confirmed and emails sent');
       
@@ -207,7 +306,7 @@ app.post('/api/confirm-payment', async (req, res) => {
       res.json({
         success: false,
         status: paymentIntent.status,
-        message: `Payment status is ${paymentIntent.status}`
+        message: `Payment status: ${paymentIntent.status}`
       });
     }
 
@@ -215,7 +314,7 @@ app.post('/api/confirm-payment', async (req, res) => {
     console.error('❌ Error confirming payment:', error);
     res.status(500).json({ 
       success: false,
-      error: error.message || 'Failed to confirm payment' 
+      error: error.message || 'Failed to confirm payment'
     });
   }
 });
@@ -225,7 +324,6 @@ app.post('/api/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  // Check if webhook secret is configured
   if (!webhookSecret) {
     console.error('❌ STRIPE_WEBHOOK_SECRET is not configured');
     return res.status(500).json({ error: 'Webhook secret not configured' });
@@ -234,23 +332,20 @@ app.post('/api/webhook', async (req, res) => {
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    event = stripeClient.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
     console.error('❌ Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle the event
   try {
+    // Handle the event
     switch (event.type) {
       case 'payment_intent.succeeded':
         const paymentIntent = event.data.object;
         console.log('✅ Payment succeeded via webhook:', paymentIntent.id);
         
-        // Send confirmation emails if email is configured
-        if (emailTransporter) {
-          await sendOrderEmails(paymentIntent);
-        }
+        await sendOrderEmails(paymentIntent);
         break;
 
       case 'payment_intent.payment_failed':
@@ -258,8 +353,13 @@ app.post('/api/webhook', async (req, res) => {
         console.log('❌ Payment failed via webhook:', failedPayment.id);
         break;
 
+      case 'checkout.session.completed':
+        const session = event.data.object;
+        console.log('✅ Checkout session completed:', session.id);
+        break;
+
       default:
-        console.log(`ℹ️ Unhandled event type ${event.type}`);
+        console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
 
     res.json({ received: true });
@@ -269,24 +369,23 @@ app.post('/api/webhook', async (req, res) => {
   }
 });
 
-// Send order confirmation emails (works for both Stripe and PayPal)
+// Send order confirmation emails
 async function sendOrderEmails(paymentData, customer = null, items = null, totalAmount = null) {
   try {
-    // Handle both Stripe and PayPal payment objects
     let customerEmail, customerName, amount, paymentId, paymentMethod;
     
     if (paymentData.object === 'payment_intent') {
       // Stripe payment
       customerEmail = paymentData.receipt_email || paymentData.metadata?.customer_email;
       customerName = paymentData.metadata?.customer_name || 'Customer';
-      amount = (paymentData.amount / 100).toFixed(2);
+      amount = formatCurrency(paymentData.amount, paymentData.currency);
       paymentId = paymentData.id;
-      paymentMethod = 'Credit Card (Stripe)';
+      paymentMethod = 'Credit/Debit Card';
     } else {
       // PayPal payment
       customerEmail = customer?.email || paymentData.payer?.email_address;
       customerName = customer?.name || 'Customer';
-      amount = totalAmount?.toFixed(2) || paymentData.amount?.value;
+      amount = formatCurrency(totalAmount, 'USD');
       paymentId = paymentData.id;
       paymentMethod = 'PayPal';
     }
@@ -298,76 +397,18 @@ async function sendOrderEmails(paymentData, customer = null, items = null, total
 
     // Email to business
     const businessEmailOptions = {
-      from: process.env.EMAIL_USER,
-      to: process.env.BUSINESS_EMAIL || 'anaroyes7@gmail.com',
-      subject: `New Order - Payment ${paymentId}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <h2 style="color: #333; border-bottom: 2px solid #8B4513; padding-bottom: 10px;">
-            New Order Received
-          </h2>
-          
-          <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #8B4513; margin-top: 0;">Payment Details</h3>
-            <p><strong>Payment ID:</strong> ${paymentId}</p>
-            <p><strong>Amount:</strong> $${amount}</p>
-            <p><strong>Payment Method:</strong> ${paymentMethod}</p>
-            <p><strong>Customer:</strong> ${customerName}</p>
-            <p><strong>Email:</strong> ${customerEmail}</p>
-            <p><strong>Date:</strong> ${new Date().toLocaleDateString()}</p>
-          </div>
-          
-          <div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 20px 0;">
-            <p style="margin: 0; color: #2d5a2d;">
-              <strong>Action Required:</strong> Please process this order and prepare for shipment.
-            </p>
-          </div>
-        </div>
-      `
+      from: `"PAKBH Orders" <${process.env.EMAIL_USER}>`,
+      to: process.env.BUSINESS_EMAIL,
+      subject: `📦 New Order #${paymentId.slice(-8)}`,
+      html: generateBusinessEmailTemplate(paymentId, amount, paymentMethod, customerName, customerEmail)
     };
 
     // Email to customer
     const customerEmailOptions = {
-      from: process.env.EMAIL_USER,
+      from: `"PAKBH Support" <${process.env.EMAIL_USER}>`,
       to: customerEmail,
-      subject: `Order Confirmation - Payment ${paymentId}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #8B4513, #A0522D); color: white; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
-            <h1 style="margin: 0; font-size: 28px;">Thank You for Your Order!</h1>
-            <p style="margin: 10px 0 0 0; font-size: 18px;">Payment ID: ${paymentId}</p>
-          </div>
-          
-          <div style="padding: 30px; background: white; border: 1px solid #ddd; border-top: none;">
-            <p style="font-size: 16px; color: #333;">
-              Hi ${customerName},
-            </p>
-            <p style="font-size: 16px; color: #333;">
-              Thank you for choosing PAKBH! We've received your payment of <strong>$${amount}</strong> via ${paymentMethod} and are preparing your order for shipment.
-            </p>
-            
-            <div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 20px 0;">
-              <h4 style="color: #2d5a2d; margin-top: 0;">What's Next?</h4>
-              <ul style="color: #2d5a2d; margin: 0; padding-left: 20px;">
-                <li>We'll process your order within 24 hours</li>
-                <li>You'll receive a tracking number via email</li>
-                <li>Free worldwide shipping included</li>
-                <li>Expected delivery: 5-7 business days</li>
-              </ul>
-            </div>
-            
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="https://wa.me/+33634549649" style="background: #25D366; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                Contact us on WhatsApp
-              </a>
-            </div>
-            
-            <p style="color: #666; font-size: 14px; text-align: center;">
-              Questions? Reply to this email or contact us on WhatsApp for instant support.
-            </p>
-          </div>
-        </div>
-      `
+      subject: `✅ Order Confirmation #${paymentId.slice(-8)}`,
+      html: generateCustomerEmailTemplate(paymentId, amount, paymentMethod, customerName)
     };
 
     // Send emails
@@ -383,20 +424,108 @@ async function sendOrderEmails(paymentData, customer = null, items = null, total
   }
 }
 
+// Email template generators
+function generateBusinessEmailTemplate(paymentId, amount, paymentMethod, customerName, customerEmail) {
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #333; border-bottom: 2px solid #8B4513; padding-bottom: 10px;">
+        New Order Received
+      </h2>
+      
+      <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0;">
+        <h3 style="color: #8B4513; margin-top: 0;">Order Details</h3>
+        <p><strong>Order ID:</strong> ${paymentId}</p>
+        <p><strong>Amount:</strong> ${amount}</p>
+        <p><strong>Payment Method:</strong> ${paymentMethod}</p>
+        <p><strong>Customer:</strong> ${customerName}</p>
+        <p><strong>Email:</strong> ${customerEmail}</p>
+        <p><strong>Date:</strong> ${new Date().toLocaleDateString()}</p>
+      </div>
+    </div>
+  `;
+}
+
+function generateCustomerEmailTemplate(paymentId, amount, paymentMethod, customerName) {
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background: linear-gradient(135deg, #8B4513, #A0522D); color: white; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+        <h1 style="margin: 0; font-size: 28px;">Thank You for Your Order!</h1>
+        <p style="margin: 10px 0 0 0; font-size: 16px;">Order #${paymentId.slice(-8)}</p>
+      </div>
+      
+      <div style="padding: 30px; background: white; border: 1px solid #ddd; border-top: none;">
+        <p style="font-size: 16px; color: #333;">
+          Hi ${customerName},
+        </p>
+        <p style="font-size: 16px; color: #333;">
+          Thank you for choosing PAKBH! We've received your payment of <strong>${amount}</strong> via ${paymentMethod} and are preparing your order for shipment.
+        </p>
+        
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="https://wa.me/+33634549649" style="background: #25D366; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+            Contact us on WhatsApp
+          </a>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// Enhanced error handling
+function handlePaymentError(error, paymentMethod = 'unknown') {
+  console.error(`❌ ${paymentMethod} payment error:`, error);
+  
+  if (error.type === 'StripeCardError') {
+    return { 
+      message: error.message, 
+      code: error.code,
+      status: 400
+    };
+  } else if (error.type === 'StripeInvalidRequestError') {
+    return { 
+      message: 'Invalid payment request', 
+      code: 'invalid_request',
+      status: 400
+    };
+  } else if (error.type === 'StripeAuthenticationError') {
+    return { 
+      message: 'Payment authentication failed', 
+      code: 'authentication_error',
+      status: 401
+    };
+  } else if (error.type === 'StripeRateLimitError') {
+    return { 
+      message: 'Too many requests, please try again later', 
+      code: 'rate_limit',
+      status: 429
+    };
+  } else if (error.type === 'StripeConnectionError') {
+    return { 
+      message: 'Network connection failed', 
+      code: 'connection_error',
+      status: 503
+    };
+  } else {
+    return { 
+      message: 'An unexpected error occurred', 
+      code: 'unknown_error',
+      status: 500
+    };
+  }
+}
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    market: 'United States',
-    location: 'Miami, FL',
-    stripe_connected: !!stripe,
-    stripe_key_configured: !!process.env.STRIPE_SECRET_KEY,
-    email_configured: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS),
+    service: 'PAKBH Payment API',
+    version: '1.0.0',
     environment: process.env.NODE_ENV || 'development',
+    stripe_connected: !!stripeClient,
+    email_configured: !!process.env.EMAIL_USER,
     supported_payment_methods: ['stripe', 'paypal'],
-    shipping_zones: ['US', 'Canada', 'Mexico', 'Caribbean', 'International'],
-    cors_allowed_origins: allowedOrigins
+    uptime: process.uptime()
   });
 });
 
@@ -404,32 +533,36 @@ app.get('/api/health', (req, res) => {
 app.get('/api/payment-intent/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const paymentIntent = await stripe.paymentIntents.retrieve(id);
+    const paymentIntent = await stripeClient.paymentIntents.retrieve(id);
     
     res.json({
       success: true,
-      id: paymentIntent.id,
-      status: paymentIntent.status,
-      amount: paymentIntent.amount,
-      currency: paymentIntent.currency,
-      created: paymentIntent.created,
-      payment_method: paymentIntent.payment_method
+      payment_intent: {
+        id: paymentIntent.id,
+        status: paymentIntent.status,
+        amount: paymentIntent.amount,
+        currency: paymentIntent.currency,
+        created: new Date(paymentIntent.created * 1000).toISOString(),
+        payment_method: paymentIntent.payment_method,
+        customer: paymentIntent.customer
+      }
     });
 
   } catch (error) {
     console.error('❌ Error retrieving payment intent:', error);
     res.status(500).json({ 
       success: false,
-      error: error.message || 'Failed to retrieve payment intent' 
+      error: error.message || 'Failed to retrieve payment intent'
     });
   }
 });
 
-// 404 handler for API routes
-app.use('/api/*', (req, res) => {
+// 404 handler
+app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
-    error: 'API endpoint not found'
+    error: 'Endpoint not found',
+    path: req.originalUrl
   });
 });
 
@@ -445,14 +578,12 @@ app.use((error, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Blen Hairs USA Server running on port ${PORT}`);
-  console.log(`🇺🇸 Market: United States (Miami, FL)`);
-  console.log(`📧 Email service: ${process.env.EMAIL_USER ? 'Configured' : 'Not configured'}`);
-  console.log(`💳 Stripe: ${process.env.STRIPE_SECRET_KEY ? 'Connected' : 'Not configured'}`);
-  console.log(`🔗 Webhook endpoint: http://localhost:${PORT}/api/webhook`);
-  console.log(`💰 Supported payments: US Credit Cards, PayPal`);
-  console.log(`🚚 Shipping: Free US shipping, Canada/Mexico/International available`);
-  console.log(`🌐 CORS enabled for origins: ${allowedOrigins.join(', ')}`);
+  console.log(`🚀 PAKBH Server running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`💳 Stripe: Connected ✅`);
+  console.log(`📧 Email: ${process.env.EMAIL_USER ? 'Configured ✅' : 'Not configured ❌'}`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`💰 Supported: Credit Cards, PayPal`);
 });
 
 module.exports = app;
