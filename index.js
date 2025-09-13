@@ -33,7 +33,10 @@ const allowedOrigins = [
   'https://www.pakbh.com',
   'https://delicate-banoffee-384c86.netlify.app',
   'https://blenhairs.netlify.app',
-  'https://serveforpakbh.onrender.com'
+  'https://serveforpakbh.onrender.com',
+  // Add any other domains you might use
+  'https://pakbh.hostinger.com',
+  'https://www.pakbh.hostinger.com'
 ];
 
 app.use(cors({
